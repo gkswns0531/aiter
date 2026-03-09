@@ -73,8 +73,10 @@ namespace vllm
     __device__ scalar_t sum() const { return x + y + z + w + u + v + s + t; }
   };
 
-  // TODO(woosuk): Further optimize this kernel.
-  template <typename scalar_t>
+  // USE_SHMEM: cache input in shared memory during 1st pass (variance),
+  // reuse from shmem in 2nd pass (normalize) to avoid global memory reload.
+  // Enabled when hidden_size * sizeof(scalar_t) fits in shared memory.
+  template <typename scalar_t, bool USE_SHMEM>
   __global__ void rms_norm_kernel(
       scalar_t *__restrict__ out,          // [..., hidden_size]
       const scalar_t *__restrict__ input,  // [..., hidden_size]
@@ -82,6 +84,9 @@ namespace vllm
       const float epsilon, const int num_tokens, const int hidden_size)
   {
     __shared__ float s_variance;
+
+    extern __shared__ __align__(16) char _shmem[];
+    vec8_t<scalar_t> *shmem = reinterpret_cast<vec8_t<scalar_t> *>(_shmem);
 
     vec8_t<scalar_t> v8_variance = {0, 0, 0, 0, 0, 0, 0, 0};
 
@@ -92,10 +97,14 @@ namespace vllm
         reinterpret_cast<vec8_t<scalar_t> const *>(weight);
     const int vec_hidden_size = hidden_size >> 3;
 
-    // Compute variance. Be careful, hidden_size should multiple of 4.
+    // 1st pass: compute variance. Cache input in shmem if enabled.
     for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x)
     {
       vec8_t<scalar_t> x = vectorized_in[blockIdx.x * vec_hidden_size + idx];
+      if (USE_SHMEM)
+      {
+        shmem[idx] = x;
+      }
       v8_variance += x * x;
     }
     float v8_variance_sum = v8_variance.sum();
@@ -111,9 +120,11 @@ namespace vllm
     }
     __syncthreads();
 
+    // 2nd pass: normalize. Read from shmem if cached, else reload from global.
     for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x)
     {
-      vec8_t<scalar_t> v8_in = vectorized_in[blockIdx.x * vec_hidden_size + idx];
+      vec8_t<scalar_t> v8_in =
+          USE_SHMEM ? shmem[idx] : vectorized_in[blockIdx.x * vec_hidden_size + idx];
       vec8_t<scalar_t> v8_w = vectorized_weight[idx];
       vectorized_out[blockIdx.x * vec_hidden_size + idx] =
           v8_in * s_variance * v8_w;
@@ -566,10 +577,48 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
   dim3 block(std::min(hidden_size, 1024));
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
   const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+  // Cache input in shared memory to avoid 2nd pass global reload.
+  // shmem stores vec8_t elements: hidden_size * sizeof(scalar_t) bytes needed.
+  // Reserve 1KB for static shared memory (s_variance + BlockReduce::TempStorage).
+  constexpr size_t STATIC_SHMEM_RESERVE = 1024;
+
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
-                               { vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
-                                     out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                                     weight.data_ptr<scalar_t>(), epsilon, num_tokens, hidden_size); });
+                               {
+    const size_t shmem_size = hidden_size * sizeof(scalar_t);
+
+    // Query actual device shared memory limit.
+    int device;
+    hipGetDevice(&device);
+    int max_shmem_per_block;
+    hipDeviceGetAttribute(&max_shmem_per_block,
+                          hipDeviceAttributeMaxSharedMemoryPerBlock, device);
+
+    bool use_shmem = (shmem_size + STATIC_SHMEM_RESERVE <=
+                      static_cast<size_t>(max_shmem_per_block));
+
+    // For shmem >= 48KB, request dynamic shared memory capacity.
+    if (use_shmem && shmem_size >= (48 << 10))
+    {
+      hipError_t ret = hipFuncSetAttribute(
+          reinterpret_cast<const void *>(vllm::rms_norm_kernel<scalar_t, true>),
+          hipFuncAttributeMaxDynamicSharedMemorySize,
+          shmem_size);
+      use_shmem = (ret == hipSuccess);
+    }
+
+    if (use_shmem)
+    {
+      vllm::rms_norm_kernel<scalar_t, true><<<grid, block, shmem_size, stream>>>(
+          out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+          weight.data_ptr<scalar_t>(), epsilon, num_tokens, hidden_size);
+    }
+    else
+    {
+      vllm::rms_norm_kernel<scalar_t, false><<<grid, block, 0, stream>>>(
+          out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+          weight.data_ptr<scalar_t>(), epsilon, num_tokens, hidden_size);
+    } });
 }
 
 // void scaled_rms_norm(torch::Tensor& out,     // [..., hidden_size]
