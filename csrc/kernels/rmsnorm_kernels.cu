@@ -579,29 +579,21 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
   const hipStream_t stream = at::hip::getCurrentHIPStream();
 
   // Cache input in shared memory to avoid 2nd pass global reload.
-  // Only beneficial when hidden_size is large enough that L2 cache pressure
-  // makes global reload expensive. Below 32KB, L2 hit rate is already high
-  // and shmem write overhead dominates.
-  constexpr size_t SHMEM_MIN_THRESHOLD = 32 << 10;  // 32KB
   constexpr size_t STATIC_SHMEM_RESERVE = 1024;
 
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
                                {
     const size_t shmem_size = hidden_size * sizeof(scalar_t);
 
-    bool use_shmem = (shmem_size >= SHMEM_MIN_THRESHOLD);
+    // Query actual device shared memory limit.
+    int device;
+    hipGetDevice(&device);
+    int max_shmem_per_block;
+    hipDeviceGetAttribute(&max_shmem_per_block,
+                          hipDeviceAttributeMaxSharedMemoryPerBlock, device);
 
-    if (use_shmem)
-    {
-      // Query actual device shared memory limit.
-      int device;
-      hipGetDevice(&device);
-      int max_shmem_per_block;
-      hipDeviceGetAttribute(&max_shmem_per_block,
-                            hipDeviceAttributeMaxSharedMemoryPerBlock, device);
-      use_shmem = (shmem_size + STATIC_SHMEM_RESERVE <=
-                   static_cast<size_t>(max_shmem_per_block));
-    }
+    bool use_shmem = (shmem_size + STATIC_SHMEM_RESERVE <=
+                      static_cast<size_t>(max_shmem_per_block));
 
     // For shmem >= 48KB, request dynamic shared memory capacity.
     if (use_shmem && shmem_size >= (48 << 10))
